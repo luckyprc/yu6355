@@ -2,18 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 ====================================================
-CFLUE 题库自动下载转换器 v2
+CFLUE 题库自动下载转换器 v3
 ====================================================
 修复：
-  - datasets 5.0.0 不再支持 trust_remote_code
-  - HuggingFace 数据集名称可能不存在，改用多源下载
-  - 增加 ModelScope 直链下载作为备选
+  - 使用正确的 HuggingFace 数据集名称
+  - 增加 GitHub 仓库直接下载
+  - 增加 ModelScope 数据集下载
+  - 增加本地文件自动检测
 
 依赖：
-  pip install datasets requests
+  pip install datasets requests pandas
 
 用法：
-  python convert_cflue.py
+  python convert_cflue_v3.py
   输出：questions.json
 """
 
@@ -23,28 +24,38 @@ import sys
 import os
 import re
 import hashlib
+import subprocess
 import requests
 
 OUTPUT_FILE = "questions.json"
 
-# 多源下载配置
+# 多源下载配置（按优先级）
 SOURCES = [
     {
-        "name": "HuggingFace datasets API",
+        "name": "HuggingFace datasets (CFLUE)",
         "type": "hf_api",
-        "dataset": "tongyi_dianjin/CFLUE",
+        "dataset": "CFLUE",  # 修正：正确的数据集名称
         "config": "knowledge",
         "split": "train"
     },
     {
-        "name": "ModelScope 直链",
-        "type": "ms_direct",
-        "url": "https://www.modelscope.cn/api/v1/datasets/tongyi_dianjin/CFLUE/repo?Revision=master&FilePath=knowledge%2Ftrain.jsonl"
+        "name": "HuggingFace datasets (aliyun/cflue)",
+        "type": "hf_api",
+        "dataset": "aliyun/cflue",
+        "config": "knowledge",
+        "split": "train"
     },
     {
-        "name": "HuggingFace parquet",
-        "type": "hf_parquet",
-        "url": "https://huggingface.co/datasets/tongyi_dianjin/CFLUE/resolve/main/knowledge/train-00000-of-00001.parquet"
+        "name": "GitHub 仓库直接下载",
+        "type": "github_clone",
+        "repo": "https://github.com/aliyun/cflue.git",
+        "data_path": "data/knowledge"
+    },
+    {
+        "name": "ModelScope 数据集",
+        "type": "ms_api",
+        "dataset": "tongyi_dianjin/CFLUE",
+        "config": "knowledge"
     }
 ]
 
@@ -53,125 +64,125 @@ def download_hf_api(source):
     """使用 datasets 库从 HuggingFace 下载"""
     try:
         from datasets import load_dataset
-        print(f"[*] 尝试从 HuggingFace 下载: {source['dataset']}")
-        ds = load_dataset(source["dataset"], source["config"], split=source["split"])
-        data = []
-        for item in ds:
-            data.append(dict(item))
-        print(f"[+] HuggingFace 下载成功: {len(data)} 条")
+        print(f"[*] 尝试 HuggingFace: {source['dataset']}")
+        ds = load_dataset(source["dataset"], source.get("config"), split=source.get("split", "train"))
+        data = [dict(item) for item in ds]
+        print(f"[+] 成功: {len(data)} 条")
         return data
     except Exception as e:
-        print(f"[!] HuggingFace API 失败: {e}")
+        print(f"[!] 失败: {e}")
         return None
 
 
-def download_direct(source):
-    """使用 requests 直接下载 JSON/JSONL"""
+def download_github_clone(source):
+    """Git clone 仓库并读取数据文件"""
     try:
-        url = source["url"]
-        print(f"[*] 尝试直接下载: {url[:60]}...")
-        resp = requests.get(url, timeout=120, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        print(f"[*] 尝试 GitHub clone: {source['repo']}")
+        tmp_dir = "/tmp/cflue_repo"
+
+        # 清理旧目录
+        if os.path.exists(tmp_dir):
+            subprocess.run(["rm", "-rf", tmp_dir], check=False)
+
+        # 浅克隆
+        result = subprocess.run(
+            ["git", "clone", "--depth", "1", source["repo"], tmp_dir],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode != 0:
+            print(f"[!] git clone 失败: {result.stderr[:200]}")
+            return None
+
+        # 查找数据文件
+        data_path = os.path.join(tmp_dir, source.get("data_path", "data/knowledge"))
+        if not os.path.exists(data_path):
+            print(f"[!] 数据路径不存在: {data_path}")
+            return None
+
+        # 尝试读取各种格式的文件
+        data = []
+        for filename in os.listdir(data_path):
+            filepath = os.path.join(data_path, filename)
+            if filename.endswith('.json'):
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    if content.startswith('['):
+                        data.extend(json.loads(content))
+                    else:
+                        # JSONL 格式
+                        for line in content.split('\n'):
+                            if line.strip():
+                                data.append(json.loads(line))
+            elif filename.endswith('.jsonl'):
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if line.strip():
+                            data.append(json.loads(line))
+
+        if data:
+            print(f"[+] 成功: {len(data)} 条")
+            return data
+        return None
+    except Exception as e:
+        print(f"[!] 失败: {e}")
+        return None
+
+
+def download_ms_api(source):
+    """从 ModelScope 下载数据集"""
+    try:
+        print(f"[*] 尝试 ModelScope: {source['dataset']}")
+        # ModelScope 数据集下载需要 SDK，这里尝试直接下载
+        url = f"https://www.modelscope.cn/api/v1/datasets/{source['dataset']}/repo?Revision=master&FilePath=data%2Fknowledge%2Ftrain.json"
+        resp = requests.get(url, timeout=60, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         })
         resp.raise_for_status()
 
         content = resp.text.strip()
-        # 判断是 JSON 数组还是 JSONL
-        if content.startswith("["):
+        if content.startswith('['):
             data = json.loads(content)
         else:
-            # JSONL 格式，每行一个 JSON
-            data = []
-            for line in content.split("\n"):
-                line = line.strip()
-                if line:
-                    data.append(json.loads(line))
+            data = [json.loads(line) for line in content.split('\n') if line.strip()]
 
-        print(f"[+] 直接下载成功: {len(data)} 条")
+        print(f"[+] 成功: {len(data)} 条")
         return data
     except Exception as e:
-        print(f"[!] 直接下载失败: {e}")
+        print(f"[!] 失败: {e}")
         return None
-
-
-def download_parquet(source):
-    """下载 parquet 文件并解析"""
-    try:
-        import pandas as pd
-        url = source["url"]
-        print(f"[*] 尝试下载 parquet: {url[:60]}...")
-        resp = requests.get(url, timeout=120)
-        resp.raise_for_status()
-
-        # 保存临时文件
-        tmp = "/tmp/cflue.parquet"
-        with open(tmp, "wb") as f:
-            f.write(resp.content)
-
-        df = pd.read_parquet(tmp)
-        data = df.to_dict("records")
-        print(f"[+] Parquet 解析成功: {len(data)} 条")
-        return data
-    except ImportError:
-        print("[!] 缺少 pandas，跳过 parquet 解析")
-        return None
-    except Exception as e:
-        print(f"[!] Parquet 下载失败: {e}")
-        return None
-
-
-def download_all():
-    """按优先级尝试所有下载源"""
-    for source in SOURCES:
-        print(f"\n{'='*50}")
-        print(f"[*] 尝试下载源: {source['name']}")
-
-        if source["type"] == "hf_api":
-            data = download_hf_api(source)
-        elif source["type"] == "ms_direct":
-            data = download_direct(source)
-        elif source["type"] == "hf_parquet":
-            data = download_parquet(source)
-        else:
-            data = None
-
-        if data and len(data) > 0:
-            return data
-
-    return None
 
 
 def load_local():
     """查找本地已有的数据文件"""
-    local_files = [
-        "cflue_knowledge.json",
-        "cflue.json",
-        "data.json",
-        "train.json",
-        "train.jsonl"
+    local_patterns = [
+        "cflue_knowledge.json", "cflue.json", "data.json",
+        "train.json", "train.jsonl", "dev.json", "test.json"
     ]
-    for f in local_files:
-        if os.path.exists(f):
-            print(f"[*] 发现本地文件: {f}")
-            with open(f, "r", encoding="utf-8") as fp:
-                content = fp.read().strip()
-                if content.startswith("["):
-                    return json.loads(content)
-                else:
-                    return [json.loads(line) for line in content.split("\n") if line.strip()]
+    for pattern in local_patterns:
+        for f in os.listdir('.'):
+            if f.endswith(pattern) or f == pattern:
+                print(f"[*] 发现本地文件: {f}")
+                with open(f, 'r', encoding='utf-8') as fp:
+                    content = fp.read().strip()
+                    if content.startswith('['):
+                        return json.loads(content)
+                    else:
+                        return [json.loads(line) for line in content.split('\n') if line.strip()]
     return None
 
 
 def parse_choices(choices_str):
     """解析 CFLUE 的 choices 字符串"""
     if isinstance(choices_str, dict):
-        return [choices_str.get(k, "") for k in sorted(choices_str.keys())]
+        keys = sorted(choices_str.keys())
+        return [choices_str.get(k, "") for k in keys]
     if isinstance(choices_str, list):
         return choices_str
     try:
         d = ast.literal_eval(choices_str)
         if isinstance(d, dict):
-            return [d.get(k, "") for k in sorted(d.keys())]
+            keys = sorted(d.keys())
+            return [d.get(k, "") for k in keys]
     except:
         pass
     matches = re.findall(r"['\"]([A-D])['\"]\s*:\s*['\"](.*?)['\"](?:,|\})", choices_str)
@@ -229,11 +240,24 @@ def convert_item(item):
 
 def main():
     print("="*60)
-    print("CFLUE 题库自动下载转换器 v2")
+    print("CFLUE 题库自动下载转换器 v3")
     print("="*60)
 
     # 1. 尝试多源下载
-    data = download_all()
+    data = None
+    for source in SOURCES:
+        print(f"\n{'='*50}")
+        print(f"[*] 尝试下载源: {source['name']}")
+
+        if source["type"] == "hf_api":
+            data = download_hf_api(source)
+        elif source["type"] == "github_clone":
+            data = download_github_clone(source)
+        elif source["type"] == "ms_api":
+            data = download_ms_api(source)
+
+        if data and len(data) > 0:
+            break
 
     # 2. 降级到本地文件
     if data is None:
@@ -243,7 +267,7 @@ def main():
     if data is None or len(data) == 0:
         print("\n[!] 未能获取 CFLUE 数据")
         print("[*] 请手动下载数据文件后重命名为 cflue.json 或 train.jsonl 放到仓库根目录")
-        print("[*] 下载地址: https://modelscope.cn/datasets/tongyi_dianjin/CFLUE")
+        print("[*] 下载地址: https://github.com/aliyun/cflue")
         sys.exit(1)
 
     print(f"\n[*] 原始数据: {len(data)} 条")
