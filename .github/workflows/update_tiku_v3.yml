@@ -24,7 +24,7 @@ jobs:
 
     - name: Download and convert CFLUE
       run: |
-        python convert_cflue_v2.py
+        python convert_cflue_v3.py
 
     - name: Check if updated
       id: check
