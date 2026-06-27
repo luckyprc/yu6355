@@ -2,20 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 ====================================================
-CFLUE 题库自动下载转换器
+CFLUE 题库自动下载转换器 v2
 ====================================================
-功能：
-  1. 从 HuggingFace / ModelScope 自动下载 CFLUE 数据集
-  2. 提取经济师相关题目（中级/初级/高级经济师）
-  3. 转换为刷题系统标准 JSON 格式
-  4. 去重、格式化、输出固定文件名
+修复：
+  - datasets 5.0.0 不再支持 trust_remote_code
+  - HuggingFace 数据集名称可能不存在，改用多源下载
+  - 增加 ModelScope 直链下载作为备选
 
 依赖：
-  pip install datasets huggingface_hub requests
+  pip install datasets requests
 
 用法：
   python convert_cflue.py
-  输出：questions.json（直接可被刷题系统引用）
+  输出：questions.json
 """
 
 import json
@@ -24,60 +23,142 @@ import sys
 import os
 import re
 import hashlib
-
-# 尝试导入 datasets，如果失败则降级为 requests 直接下载
-try:
-    from datasets import load_dataset
-    HAS_DATASETS = True
-except ImportError:
-    HAS_DATASETS = False
-    print("[!] datasets 库未安装，尝试用 requests 直接下载...")
-
-try:
-    import requests
-except ImportError:
-    print("[!] 缺少 requests，请安装: pip install requests")
-    raise SystemExit(1)
+import requests
 
 OUTPUT_FILE = "questions.json"
 
-# CFLUE 在 HuggingFace 上的数据集名称
-HF_DATASET_NAME = "tongyi_dianjin/CFLUE"
+# 多源下载配置
+SOURCES = [
+    {
+        "name": "HuggingFace datasets API",
+        "type": "hf_api",
+        "dataset": "tongyi_dianjin/CFLUE",
+        "config": "knowledge",
+        "split": "train"
+    },
+    {
+        "name": "ModelScope 直链",
+        "type": "ms_direct",
+        "url": "https://www.modelscope.cn/api/v1/datasets/tongyi_dianjin/CFLUE/repo?Revision=master&FilePath=knowledge%2Ftrain.jsonl"
+    },
+    {
+        "name": "HuggingFace parquet",
+        "type": "hf_parquet",
+        "url": "https://huggingface.co/datasets/tongyi_dianjin/CFLUE/resolve/main/knowledge/train-00000-of-00001.parquet"
+    }
+]
 
 
-def download_via_datasets():
-    """使用 huggingface datasets 库下载"""
-    if not HAS_DATASETS:
-        return None
+def download_hf_api(source):
+    """使用 datasets 库从 HuggingFace 下载"""
     try:
-        print("[*] 尝试从 HuggingFace 下载 CFLUE...")
-        # 只下载 knowledge 部分（选择题）
-        ds = load_dataset(HF_DATASET_NAME, "knowledge", split="train", trust_remote_code=True)
+        from datasets import load_dataset
+        print(f"[*] 尝试从 HuggingFace 下载: {source['dataset']}")
+        ds = load_dataset(source["dataset"], source["config"], split=source["split"])
         data = []
         for item in ds:
             data.append(dict(item))
         print(f"[+] HuggingFace 下载成功: {len(data)} 条")
         return data
     except Exception as e:
-        print(f"[!] HuggingFace 下载失败: {e}")
+        print(f"[!] HuggingFace API 失败: {e}")
         return None
 
 
-def download_via_requests():
-    """降级：尝试从已知 URL 直接下载（如果数据集有公开直链）"""
-    # CFLUE 数据通常需要通过 git-lfs 或 datasets 库下载
-    # 这里提供一个备选方案：如果用户已手动下载到本地
+def download_direct(source):
+    """使用 requests 直接下载 JSON/JSONL"""
+    try:
+        url = source["url"]
+        print(f"[*] 尝试直接下载: {url[:60]}...")
+        resp = requests.get(url, timeout=120, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        resp.raise_for_status()
+
+        content = resp.text.strip()
+        # 判断是 JSON 数组还是 JSONL
+        if content.startswith("["):
+            data = json.loads(content)
+        else:
+            # JSONL 格式，每行一个 JSON
+            data = []
+            for line in content.split("\n"):
+                line = line.strip()
+                if line:
+                    data.append(json.loads(line))
+
+        print(f"[+] 直接下载成功: {len(data)} 条")
+        return data
+    except Exception as e:
+        print(f"[!] 直接下载失败: {e}")
+        return None
+
+
+def download_parquet(source):
+    """下载 parquet 文件并解析"""
+    try:
+        import pandas as pd
+        url = source["url"]
+        print(f"[*] 尝试下载 parquet: {url[:60]}...")
+        resp = requests.get(url, timeout=120)
+        resp.raise_for_status()
+
+        # 保存临时文件
+        tmp = "/tmp/cflue.parquet"
+        with open(tmp, "wb") as f:
+            f.write(resp.content)
+
+        df = pd.read_parquet(tmp)
+        data = df.to_dict("records")
+        print(f"[+] Parquet 解析成功: {len(data)} 条")
+        return data
+    except ImportError:
+        print("[!] 缺少 pandas，跳过 parquet 解析")
+        return None
+    except Exception as e:
+        print(f"[!] Parquet 下载失败: {e}")
+        return None
+
+
+def download_all():
+    """按优先级尝试所有下载源"""
+    for source in SOURCES:
+        print(f"\n{'='*50}")
+        print(f"[*] 尝试下载源: {source['name']}")
+
+        if source["type"] == "hf_api":
+            data = download_hf_api(source)
+        elif source["type"] == "ms_direct":
+            data = download_direct(source)
+        elif source["type"] == "hf_parquet":
+            data = download_parquet(source)
+        else:
+            data = None
+
+        if data and len(data) > 0:
+            return data
+
+    return None
+
+
+def load_local():
+    """查找本地已有的数据文件"""
     local_files = [
         "cflue_knowledge.json",
         "cflue.json",
         "data.json",
-        "train.json"
+        "train.json",
+        "train.jsonl"
     ]
     for f in local_files:
         if os.path.exists(f):
             print(f"[*] 发现本地文件: {f}")
             with open(f, "r", encoding="utf-8") as fp:
-                return json.load(fp)
+                content = fp.read().strip()
+                if content.startswith("["):
+                    return json.loads(content)
+                else:
+                    return [json.loads(line) for line in content.split("\n") if line.strip()]
     return None
 
 
@@ -87,14 +168,12 @@ def parse_choices(choices_str):
         return [choices_str.get(k, "") for k in sorted(choices_str.keys())]
     if isinstance(choices_str, list):
         return choices_str
-    # 字符串形式: "{'A': '...', 'B': '...'}"
     try:
         d = ast.literal_eval(choices_str)
         if isinstance(d, dict):
             return [d.get(k, "") for k in sorted(d.keys())]
     except:
         pass
-    # 兜底：正则提取
     matches = re.findall(r"['\"]([A-D])['\"]\s*:\s*['\"](.*?)['\"](?:,|\})", choices_str)
     if matches:
         return [m[1] for m in sorted(matches, key=lambda x: x[0])]
@@ -104,8 +183,6 @@ def parse_choices(choices_str):
 def convert_item(item):
     """将 CFLUE 单条数据转换为标准格式"""
     name = item.get("名称", item.get("name", item.get("exam_type", "")))
-
-    # 只保留经济师相关
     if "中级经济师" not in name:
         return None
 
@@ -113,12 +190,10 @@ def convert_item(item):
     if not question:
         return None
 
-    # 解析选项
     options = parse_choices(item.get("choices", item.get("选项", item.get("options", {}))))
     if len(options) < 2:
         return None
 
-    # 解析答案
     ans = item.get("answer", item.get("答案", item.get("correct", "A")))
     if isinstance(ans, int):
         answer = [ans]
@@ -127,32 +202,17 @@ def convert_item(item):
     elif isinstance(ans, list):
         answer = [ord(a.upper()) - ord("A") if isinstance(a, str) and len(a) == 1 else int(a) for a in ans]
     else:
-        answer = [0]  # 兜底
+        answer = [0]
 
-    # 题型判断
     task = item.get("task", item.get("题型", ""))
     q_type = "multiple" if "多" in task or len(answer) > 1 else "single"
 
-    # 章节映射
-    chapter_map = {
-        "中级经济师": "中级经济师",
-        "初级经济师": "初级经济师",
-        "高级经济师": "高级经济师",
-    }
-    chapter = "经济师"
-    for k, v in chapter_map.items():
-        if k in name:
-            chapter = v
-            break
-
-    # 子分类（如果有）
+    chapter = "中级经济师" if "中级" in name else ("初级经济师" if "初级" in name else "高级经济师")
     sub = item.get("sub_type", item.get("subject", item.get("专业", "")))
     if sub:
         chapter += "-" + sub
 
     explain = item.get("analysis", item.get("解析", item.get("explanation", item.get("explain", ""))))
-
-    # 生成 UUID
     uuid = hashlib.md5((name + question).encode("utf-8")).hexdigest()[:16]
 
     return {
@@ -168,31 +228,31 @@ def convert_item(item):
 
 
 def main():
-    # 1. 下载数据
-    data = download_via_datasets()
+    print("="*60)
+    print("CFLUE 题库自动下载转换器 v2")
+    print("="*60)
+
+    # 1. 尝试多源下载
+    data = download_all()
+
+    # 2. 降级到本地文件
     if data is None:
-        data = download_via_requests()
+        print("\n[*] 尝试查找本地文件...")
+        data = load_local()
 
     if data is None or len(data) == 0:
-        print("[!] 未能获取 CFLUE 数据，请检查网络或手动下载后放置到本地")
-        print("[*] 手动下载方法：")
-        print("    1. 访问 https://modelscope.cn/datasets/tongyi_dianjin/CFLUE")
-        print("    2. 下载 knowledge 部分数据")
-        print("    3. 保存为 cflue.json 后重新运行此脚本")
+        print("\n[!] 未能获取 CFLUE 数据")
+        print("[*] 请手动下载数据文件后重命名为 cflue.json 或 train.jsonl 放到仓库根目录")
+        print("[*] 下载地址: https://modelscope.cn/datasets/tongyi_dianjin/CFLUE")
         sys.exit(1)
 
-    print(f"[*] 原始数据: {len(data)} 条")
+    print(f"\n[*] 原始数据: {len(data)} 条")
 
-    # 2. 转换
-    questions = []
-    for item in data:
-        q = convert_item(item)
-        if q:
-            questions.append(q)
-
+    # 3. 转换
+    questions = [q for q in (convert_item(item) for item in data) if q]
     print(f"[*] 经济师相关题目: {len(questions)} 条")
 
-    # 3. 去重（基于 uuid）
+    # 4. 去重
     seen = set()
     uniq = []
     for q in questions:
@@ -202,30 +262,27 @@ def main():
 
     print(f"[*] 去重后: {len(uniq)} 条")
 
-    # 4. 统计
+    # 5. 统计
     chapters = {}
     for q in uniq:
         c = q["chapter"]
         chapters[c] = chapters.get(c, 0) + 1
-
     print("[*] 章节分布:")
     for c, n in sorted(chapters.items(), key=lambda x: -x[1]):
         print(f"    {c}: {n} 题")
 
-    # 5. 输出
+    # 6. 输出 JSON
     output = {
         "title": "CFLUE-经济师题库",
         "count": len(uniq),
         "updateTime": __import__("datetime").datetime.now().isoformat(),
         "questions": uniq
     }
-
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
+    print(f"\n[OK] 已保存: {OUTPUT_FILE} ({len(uniq)} 题)")
 
-    print(f"[OK] 已保存: {OUTPUT_FILE} ({len(uniq)} 题)")
-
-    # 6. 同时输出 CSV 方便查看
+    # 7. 输出 CSV
     try:
         import csv
         csv_file = OUTPUT_FILE.replace(".json", ".csv")
