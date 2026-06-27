@@ -106,7 +106,7 @@ def convert_item(item):
     name = item.get("名称", item.get("name", item.get("exam_type", "")))
 
     # 只保留经济师相关
-    if "经济师" not in name:
+    if "中级经济师" not in name:
         return None
 
     question = item.get("question", item.get("题目", item.get("q", "")))
