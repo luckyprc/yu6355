@@ -1,0 +1,46 @@
+name: Auto Update CFLUE 题库
+
+on:
+  schedule:
+    # 每天北京时间 9:00 运行 (UTC 1:00)
+    - cron: '0 1 * * *'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        pip install datasets huggingface_hub requests
+
+    - name: Download and convert CFLUE
+      run: |
+        python convert_cflue.py
+
+    - name: Check if updated
+      id: check
+      run: |
+        if git diff --quiet questions.json; then
+          echo "changed=false" >> $GITHUB_OUTPUT
+        else
+          echo "changed=true" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Commit and push
+      if: steps.check.outputs.changed == 'true'
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add questions.json questions.csv
+        git commit -m "auto: update CFLUE 题库 $(date +%Y-%m-%d)"
+        git push
